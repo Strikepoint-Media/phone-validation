@@ -4,85 +4,85 @@ import cors from "cors";
 import twilio from "twilio";
 
 const app = express();
-
-// Use Render's PORT or default to 10000 locally
 const PORT = process.env.PORT || 10000;
 
-// Twilio credentials from environment variables
-const accountSid = process.env.TWILIO_ACCOUNT_SID;
-const authToken  = process.env.TWILIO_AUTH_TOKEN;
+// env vars in Render: TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN
+const client = twilio(
+  process.env.TWILIO_ACCOUNT_SID,
+  process.env.TWILIO_AUTH_TOKEN
+);
 
-if (!accountSid || !authToken) {
-  console.error("ERROR: Missing TWILIO_ACCOUNT_SID or TWILIO_AUTH_TOKEN env vars.");
-  process.exit(1);
-}
-
-// Initialize Twilio client
-const client = twilio(accountSid, authToken);
-
-// Middleware
 app.use(cors());
 app.use(express.json());
 
-// Simple health check
 app.get("/", (req, res) => {
   res.json({ status: "ok", service: "phone-validator" });
 });
 
-/**
- * POST /validate-phone
- * Body: { "phone": "<raw phone string from form>" }
- *
- * Rules:
- *  - Twilio must be able to normalize it (e164 exists)
- *  - Must NOT be US toll-free (800/888/877/866/855/844/833/822)
- *  - Must NOT be carrier.type === "voip"
- */
+// Simple pattern filter for obviously fake numbers
+function looksFakeLocal(local) {
+  // 0000 at the end or all digits the same like 8888888, 9999999, etc.
+  if (/0000$/.test(local)) return true;
+  if (/^(\d)\1{6,}$/.test(local)) return true;
+  return false;
+}
+
 app.post("/validate-phone", async (req, res) => {
-  const { phone } = req.body;
-
-  if (!phone) {
-    return res.status(400).json({
-      valid: false,
-      message: "Please enter your phone number."
-    });
-  }
-
   try {
-    // Ask Twilio for carrier info (line type etc.)
-    const lookup = await client.lookups.v2
-      .phoneNumbers(phone)
-      .fetch({ type: ["carrier"] });
+    let raw = (req.body.phone || "").toString();
+    // strip non-digits
+    raw = raw.replace(/\D/g, "");
 
-    const carrier     = lookup.carrier || {};
-    const carrierType = (carrier.type || "").toLowerCase();
-    const e164        = (lookup.phoneNumber || "").toString();
-    const countryCode = lookup.countryCode || null;
-
-    console.log("Lookup result:", {
-      input: phone,
-      e164,
-      carrierType,
-      countryCode
-    });
-
-    // Detect US toll-free (800, 888, 877, 866, 855, 844, 833, 822)
-    const tollFreeRegex = /^\+?1(800|888|877|866|855|844|833|822)\d{7}$/;
-    const isTollFree = tollFreeRegex.test(e164);
-
-    const isVoip = carrierType === "voip";
-
-    // NEW RULE:
-    //  - Valid if Twilio could normalize it (e164 exists)
-    //  - AND it's NOT toll-free
-    //  - AND it's NOT marked VOIP
-    const ok = !!e164 && !isTollFree && !isVoip;
-
-    if (!ok) {
+    if (raw.length !== 10) {
       return res.json({
         valid: false,
-        type: carrierType || "unknown",
+        type: "unknown",
+        message: "Please enter a 10-digit US phone number."
+      });
+    }
+
+    const area = raw.slice(0, 3);
+    const local = raw.slice(3);
+
+    // block obviously fake patterns like 000-0000, 999-9999, etc
+    if (looksFakeLocal(local)) {
+      return res.json({
+        valid: false,
+        type: "fake-pattern",
         message: "Please enter a real, reachable mobile or landline number."
+      });
+    }
+
+    const e164 = "+1" + raw;
+
+    // Ask Twilio with line_type_intelligence
+    const lookup = await client.lookups.v2
+      .phoneNumbers(e164)
+      .fetch({ fields: "line_type_intelligence" });
+
+    // Twilio fields
+    const countryCode = lookup.countryCode || null;
+    const lti = lookup.lineTypeIntelligence || {};
+    const lineType = (lti.lineType || "").toLowerCase() || "unknown";
+    const reachability = (lti.reachability || "").toUpperCase() || "UNKNOWN";
+
+    // Our rules:
+    const isUS = countryCode === "US";
+    const isGoodType = ["mobile", "landline", "fixed_line", "fixed_line_or_mobile"].includes(
+      lineType
+    );
+    const isReachable = reachability === "REACHABLE";
+
+    const valid = isUS && isGoodType && isReachable;
+
+    if (!valid) {
+      return res.json({
+        valid: false,
+        e164,
+        type: lineType || "unknown",
+        countryCode,
+        reachability,
+        message: "Please enter a real, reachable US mobile or landline number."
       });
     }
 
@@ -90,21 +90,20 @@ app.post("/validate-phone", async (req, res) => {
     return res.json({
       valid: true,
       e164,
-      type: carrierType || "unknown",
-      countryCode
+      type: lineType,
+      countryCode,
+      reachability
     });
   } catch (err) {
-    console.error("Twilio lookup error:", err.message);
-
-    // If Twilio can't look it up at all, treat as invalid
-    return res.json({
+    console.error("Phone validation error:", err?.message || err);
+    return res.status(500).json({
       valid: false,
-      message: "This phone number could not be verified. Please check it and try again."
+      type: "error",
+      message: "We could not verify your phone number. Please try again."
     });
   }
 });
 
-// Start server
 app.listen(PORT, () => {
   console.log(`Phone validation API listening on port ${PORT}`);
 });
