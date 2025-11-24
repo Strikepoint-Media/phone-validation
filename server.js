@@ -1,51 +1,46 @@
 // server.js
-import express from "express";
-import cors from "cors";
-import twilio from "twilio";
+const express = require("express");
+const cors = require("cors");
+const bodyParser = require("body-parser");
+const twilio = require("twilio");
 
 const app = express();
 const PORT = process.env.PORT || 10000;
 
-// env vars in Render: TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN
-const client = twilio(
-  process.env.TWILIO_ACCOUNT_SID,
-  process.env.TWILIO_AUTH_TOKEN
-);
+// DO NOT hardcode these; set in Render env vars
+const ACCOUNT_SID = process.env.TWILIO_ACCOUNT_SID;
+const AUTH_TOKEN = process.env.TWILIO_AUTH_TOKEN;
+
+if (!ACCOUNT_SID || !AUTH_TOKEN) {
+  console.error("Missing TWILIO_ACCOUNT_SID or TWILIO_AUTH_TOKEN env vars");
+}
+
+const client = twilio(ACCOUNT_SID, AUTH_TOKEN);
 
 app.use(cors());
-app.use(express.json());
+app.use(bodyParser.json());
 
 app.get("/", (req, res) => {
   res.json({ status: "ok", service: "phone-validator" });
 });
 
-// Simple pattern filter for obviously fake numbers
-function looksFakeLocal(local) {
-  // 0000 at the end or all digits the same like 8888888, 9999999, etc.
-  if (/0000$/.test(local)) return true;
-  if (/^(\d)\1{6,}$/.test(local)) return true;
-  return false;
-}
-
 app.post("/validate-phone", async (req, res) => {
   try {
-    let raw = (req.body.phone || "").toString();
-    // strip non-digits
-    raw = raw.replace(/\D/g, "");
+    const raw = (req.body.phone || "").toString().replace(/\D/g, "");
 
     if (raw.length !== 10) {
       return res.json({
         valid: false,
-        type: "unknown",
+        type: "bad-length",
         message: "Please enter a 10-digit US phone number."
       });
     }
 
-    const area = raw.slice(0, 3);
-    const local = raw.slice(3);
+    // Basic pattern filters for obvious junk
+    const local = raw.slice(3); // last 7 digits
 
-    // block obviously fake patterns like 000-0000, 999-9999, etc
-    if (looksFakeLocal(local)) {
+    // 0000 at the end or all same digit like 8888888
+    if (/0000$/.test(local) || /^(\d)\1{6,}$/.test(local)) {
       return res.json({
         valid: false,
         type: "fake-pattern",
@@ -55,51 +50,59 @@ app.post("/validate-phone", async (req, res) => {
 
     const e164 = "+1" + raw;
 
-    // Ask Twilio with line_type_intelligence
+    // Call Twilio Lookup v2 with line type intelligence
     const lookup = await client.lookups.v2
       .phoneNumbers(e164)
       .fetch({ fields: "line_type_intelligence" });
 
-    // Twilio fields
     const countryCode = lookup.countryCode || null;
     const lti = lookup.lineTypeIntelligence || {};
     const lineType = (lti.lineType || "").toLowerCase() || "unknown";
     const reachability = (lti.reachability || "").toUpperCase() || "UNKNOWN";
 
-    // Our rules:
-    const isUS = countryCode === "US";
-    const isGoodType = ["mobile", "landline", "fixed_line", "fixed_line_or_mobile"].includes(
-      lineType
-    );
-    const isReachable = reachability === "REACHABLE";
-
-    const valid = isUS && isGoodType && isReachable;
-
-    if (!valid) {
-      return res.json({
-        valid: false,
-        e164,
-        type: lineType || "unknown",
-        countryCode,
-        reachability,
-        message: "Please enter a real, reachable US mobile or landline number."
-      });
-    }
-
-    // Passed all checks
-    return res.json({
-      valid: true,
+    console.log("Twilio lookup", {
       e164,
-      type: lineType,
       countryCode,
+      lineType,
       reachability
     });
+
+    // --- NEW VALIDITY RULES ---
+
+    let valid = false;
+    let reason = "unknown";
+
+    // Must be US
+    if (countryCode !== "US") {
+      valid = false;
+      reason = "non-us";
+    } else if (reachability === "UNREACHABLE") {
+      // Twilio explicitly says it's unreachable
+      valid = false;
+      reason = "unreachable";
+    } else {
+      // Otherwise treat as valid:
+      // US number, not a fake pattern, and not explicitly unreachable.
+      valid = true;
+      reason = "ok";
+    }
+
+    return res.json({
+      valid,
+      type: lineType || "unknown",
+      countryCode,
+      reachability,
+      reason,
+      message: valid
+        ? "Valid US phone."
+        : "Please enter a real, reachable mobile or landline number."
+    });
   } catch (err) {
-    console.error("Phone validation error:", err?.message || err);
+    console.error("Error validating phone:", err);
     return res.status(500).json({
       valid: false,
       type: "error",
-      message: "We could not verify your phone number. Please try again."
+      message: "Could not validate phone number."
     });
   }
 });
