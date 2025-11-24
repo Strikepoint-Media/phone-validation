@@ -1,3 +1,4 @@
+// server.js
 import express from "express";
 import cors from "cors";
 import twilio from "twilio";
@@ -9,7 +10,7 @@ const PORT = process.env.PORT || 10000;
 
 // Twilio credentials from environment variables
 const accountSid = process.env.TWILIO_ACCOUNT_SID;
-const authToken = process.env.TWILIO_AUTH_TOKEN;
+const authToken  = process.env.TWILIO_AUTH_TOKEN;
 
 if (!accountSid || !authToken) {
   console.error("ERROR: Missing TWILIO_ACCOUNT_SID or TWILIO_AUTH_TOKEN env vars.");
@@ -33,9 +34,9 @@ app.get("/", (req, res) => {
  * Body: { "phone": "<raw phone string from form>" }
  *
  * Rules:
- *  - Must be a real, reachable number according to Twilio Lookup
- *  - Allow: mobile, landline
- *  - Block: voip, toll-free, unknown / error
+ *  - Twilio must be able to normalize it (e164 exists)
+ *  - Must NOT be US toll-free (800/888/877/866/855/844/833/822)
+ *  - Must NOT be carrier.type === "voip"
  */
 app.post("/validate-phone", async (req, res) => {
   const { phone } = req.body;
@@ -48,28 +49,34 @@ app.post("/validate-phone", async (req, res) => {
   }
 
   try {
-    // Ask Twilio for carrier info (this tells us the line type)
+    // Ask Twilio for carrier info (line type etc.)
     const lookup = await client.lookups.v2
       .phoneNumbers(phone)
       .fetch({ type: ["carrier"] });
 
-    const carrier = lookup.carrier || {};
+    const carrier     = lookup.carrier || {};
     const carrierType = (carrier.type || "").toLowerCase();
-    const e164 = (lookup.phoneNumber || "").toString();
+    const e164        = (lookup.phoneNumber || "").toString();
+    const countryCode = lookup.countryCode || null;
 
-    // Detect toll-free US numbers (800, 888, 877, 866, 855, 844, 833, 822)
+    console.log("Lookup result:", {
+      input: phone,
+      e164,
+      carrierType,
+      countryCode
+    });
+
+    // Detect US toll-free (800, 888, 877, 866, 855, 844, 833, 822)
     const tollFreeRegex = /^\+?1(800|888|877|866|855|844|833|822)\d{7}$/;
     const isTollFree = tollFreeRegex.test(e164);
 
-    // Define which line types we accept
-    const allowedTypes = ["mobile", "landline"];
-    const typeOK = allowedTypes.includes(carrierType);
-
-    // Explicit VOIP block
     const isVoip = carrierType === "voip";
 
-    // Final decision
-    const ok = typeOK && !isTollFree && !isVoip;
+    // NEW RULE:
+    //  - Valid if Twilio could normalize it (e164 exists)
+    //  - AND it's NOT toll-free
+    //  - AND it's NOT marked VOIP
+    const ok = !!e164 && !isTollFree && !isVoip;
 
     if (!ok) {
       return res.json({
@@ -83,13 +90,13 @@ app.post("/validate-phone", async (req, res) => {
     return res.json({
       valid: true,
       e164,
-      type: carrierType,
-      countryCode: lookup.countryCode
+      type: carrierType || "unknown",
+      countryCode
     });
   } catch (err) {
     console.error("Twilio lookup error:", err.message);
 
-    // If Twilio can't look it up, treat as invalid for safety
+    // If Twilio can't look it up at all, treat as invalid
     return res.json({
       valid: false,
       message: "This phone number could not be verified. Please check it and try again."
