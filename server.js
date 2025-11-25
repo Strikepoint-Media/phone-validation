@@ -1,5 +1,4 @@
-// server.js  (ESM version for Render)
-
+// server.js  (ESM - requires "type": "module" in package.json)
 import express from "express";
 import cors from "cors";
 import bodyParser from "body-parser";
@@ -8,15 +7,16 @@ import twilio from "twilio";
 const app = express();
 const PORT = process.env.PORT || 10000;
 
+// --- ENV VARS ---
 const ACCOUNT_SID = process.env.TWILIO_ACCOUNT_SID;
 const AUTH_TOKEN = process.env.TWILIO_AUTH_TOKEN;
-const VERIFY_SID = process.env.TWILIO_VERIFY_SID;
+const VERIFY_SERVICE_SID = process.env.TWILIO_VERIFY_SERVICE_SID;
 
 if (!ACCOUNT_SID || !AUTH_TOKEN) {
   console.error("Missing TWILIO_ACCOUNT_SID or TWILIO_AUTH_TOKEN env vars");
 }
-if (!VERIFY_SID) {
-  console.error("Missing TWILIO_VERIFY_SID env var");
+if (!VERIFY_SERVICE_SID) {
+  console.error("Missing TWILIO_VERIFY_SERVICE_SID env var");
 }
 
 const client = twilio(ACCOUNT_SID, AUTH_TOKEN);
@@ -24,58 +24,64 @@ const client = twilio(ACCOUNT_SID, AUTH_TOKEN);
 app.use(cors());
 app.use(bodyParser.json());
 
+// Simple healthcheck
 app.get("/", (req, res) => {
-  res.json({ status: "ok", service: "phone-validator" });
+  res.json({ status: "ok", service: "phone-validator + verify" });
 });
 
-// Helper: normalize to 10-digit US + E.164
-function normalizePhone(rawInput) {
-  const digits = (rawInput || "").toString().replace(/\D/g, "");
+// Helper: normalize to US E.164 and basic pattern checks
+function normalizeAndBasicCheck(rawPhone) {
+  const digits = (rawPhone || "").toString().replace(/\D/g, "");
+
   if (digits.length !== 10) {
-    return { error: "bad-length" };
+    return {
+      ok: false,
+      error: {
+        valid: false,
+        type: "bad-length",
+        message: "Please enter a 10-digit US phone number."
+      }
+    };
   }
 
   const local = digits.slice(3); // last 7 digits
 
-  // Reject super-obvious fake patterns
+  // Obvious junk: ends in 0000 or all same digit (e.g., 8888888)
   if (/0000$/.test(local) || /^(\d)\1{6,}$/.test(local)) {
-    return { error: "fake-pattern" };
+    return {
+      ok: false,
+      error: {
+        valid: false,
+        type: "fake-pattern",
+        message: "Please enter a real, reachable mobile or landline number."
+      }
+    };
   }
 
   return {
-    e164: `+1${digits}`,
-    digits
+    ok: true,
+    digits,
+    e164: "+1" + digits
   };
 }
 
 /**
- * POST /validate-phone
- * Body: { phone: "string" }
- * Uses Twilio Lookup v2 (line_type_intelligence) to decide if this is a
- * plausible, reachable US number. Used for real-time gating and UI.
+ * 1) LOOKUP-BASED VALIDATION
+ *    POST /validate-phone
+ *    Body: { phone: "7141231234" or "(714) 123-1234" }
+ *    Response: { valid, type, countryCode, reachability, reason, message }
  */
 app.post("/validate-phone", async (req, res) => {
   try {
-    const norm = normalizePhone(req.body.phone);
+    const norm = normalizeAndBasicCheck(req.body.phone);
 
-    if (norm.error === "bad-length") {
-      return res.json({
-        valid: false,
-        type: "bad-length",
-        message: "Please enter a 10-digit US phone number."
-      });
+    if (!norm.ok) {
+      return res.json(norm.error);
     }
 
-    if (norm.error === "fake-pattern") {
-      return res.json({
-        valid: false,
-        type: "fake-pattern",
-        message: "Please enter a real, reachable mobile or landline number."
-      });
-    }
+    const { e164, digits } = norm; // digits kept if you want it later
 
-    const { e164 } = norm;
-
+    // Twilio Lookup v2 with line type intelligence
     const lookup = await client.lookups.v2
       .phoneNumbers(e164)
       .fetch({ fields: "line_type_intelligence" });
@@ -103,9 +109,7 @@ app.post("/validate-phone", async (req, res) => {
       valid = false;
       reason = "unreachable";
     } else {
-      // Accept MOBILE, LANDLINE, VOIP, UNKNOWN as long as:
-      // - passes our pattern checks
-      // - Twilio is NOT explicitly saying "UNREACHABLE"
+      // Accept MOBILE, LANDLINE, VOIP as long as they are not unreachable.
       valid = true;
       reason = "ok";
     }
@@ -121,7 +125,7 @@ app.post("/validate-phone", async (req, res) => {
         : "Please enter a real, reachable mobile or landline number."
     });
   } catch (err) {
-    console.error("Error validating phone:", err);
+    console.error("Error validating phone via Lookup:", err);
     return res.status(500).json({
       valid: false,
       type: "error",
@@ -131,103 +135,148 @@ app.post("/validate-phone", async (req, res) => {
 });
 
 /**
- * POST /start-verify
- * Body: { phone: "string" }
- * After validate-phone passes, this sends an OTP via SMS using Twilio Verify.
+ * 2) START VERIFY (send OTP via SMS)
+ *    POST /start-verify
+ *    Body: { phone: "7141231234" }
+ *    Response: { sent: true, status, to }
+ *
+ *    This is what will start showing up in Twilio "Verify logs".
  */
 app.post("/start-verify", async (req, res) => {
   try {
-    const norm = normalizePhone(req.body.phone);
-
-    if (norm.error) {
-      return res.json({
-        ok: false,
-        reason: norm.error,
-        message: "Please enter a valid 10-digit US phone number."
-      });
+    const norm = normalizeAndBasicCheck(req.body.phone);
+    if (!norm.ok) {
+      // Return same structure as /validate-phone error
+      return res.json(norm.error);
     }
 
     const { e164 } = norm;
 
+    if (!VERIFY_SERVICE_SID) {
+      return res.status(500).json({
+        sent: false,
+        message: "Verify Service SID not configured on server."
+      });
+    }
+
+    // OPTIONAL: quick lookup gate before sending OTP
+    const lookup = await client.lookups.v2
+      .phoneNumbers(e164)
+      .fetch({ fields: "line_type_intelligence" });
+
+    const countryCode = lookup.countryCode || null;
+    const lti = lookup.lineTypeIntelligence || {};
+    const reachability = (lti.reachability || "").toUpperCase() || "UNKNOWN";
+
+    if (countryCode !== "US") {
+      return res.json({
+        sent: false,
+        reason: "non-us",
+        message: "Please enter a US phone number."
+      });
+    }
+
+    if (reachability === "UNREACHABLE") {
+      return res.json({
+        sent: false,
+        reason: "unreachable",
+        message: "This number appears unreachable. Please use a different phone."
+      });
+    }
+
+    // Send verification code via SMS
     const verification = await client.verify.v2
-      .services(VERIFY_SID)
+      .services(VERIFY_SERVICE_SID)
       .verifications.create({
         to: e164,
         channel: "sms"
       });
 
-    console.log("Started verification", {
+    console.log("Twilio Verify sent", {
       to: e164,
       sid: verification.sid,
       status: verification.status
     });
 
     return res.json({
-      ok: true,
-      status: verification.status,
-      message: "Verification code sent via SMS."
+      sent: true,
+      to: e164,
+      status: verification.status // usually "pending"
     });
   } catch (err) {
-    console.error("Error starting verification:", err);
+    console.error("Error starting Verify:", err);
     return res.status(500).json({
-      ok: false,
-      message: "Could not send verification code."
+      sent: false,
+      message: "Could not start verification."
     });
   }
 });
 
 /**
- * POST /check-verify
- * Body: { phone: "string", code: "string" }
- * Checks the OTP code. If status === "approved", we consider the phone verified.
+ * 3) CHECK VERIFY (confirm OTP)
+ *    POST /check-verify
+ *    Body: { phone: "7141231234", code: "123456" }
+ *    Response: { valid: true/false, status, message }
  */
 app.post("/check-verify", async (req, res) => {
   try {
-    const norm = normalizePhone(req.body.phone);
-    const code = (req.body.code || "").toString().trim();
-
-    if (norm.error || !code) {
+    const norm = normalizeAndBasicCheck(req.body.phone);
+    if (!norm.ok) {
       return res.json({
-        ok: false,
-        status: "invalid",
-        message: "Phone or code is missing or invalid."
+        valid: false,
+        message: norm.error.message || "Invalid phone number format."
       });
     }
 
     const { e164 } = norm;
+    const code = (req.body.code || "").toString().trim();
+
+    if (!code) {
+      return res.json({
+        valid: false,
+        message: "Verification code is required."
+      });
+    }
+
+    if (!VERIFY_SERVICE_SID) {
+      return res.status(500).json({
+        valid: false,
+        message: "Verify Service SID not configured on server."
+      });
+    }
 
     const check = await client.verify.v2
-      .services(VERIFY_SID)
+      .services(VERIFY_SERVICE_SID)
       .verificationChecks.create({
         to: e164,
         code
       });
 
-    console.log("Verification check", {
+    console.log("Twilio Verify check", {
       to: e164,
       sid: check.sid,
       status: check.status
     });
 
-    const approved = check.status === "approved";
+    const isApproved = check.status === "approved";
 
     return res.json({
-      ok: approved,
+      valid: isApproved,
       status: check.status,
-      message: approved
-        ? "Phone verified."
-        : "The code you entered is incorrect or expired."
+      message: isApproved
+        ? "Phone number successfully verified."
+        : "The verification code you entered is invalid or expired."
     });
   } catch (err) {
-    console.error("Error checking verification:", err);
+    console.error("Error checking Verify code:", err);
     return res.status(500).json({
-      ok: false,
-      status: "error",
-      message: "Error verifying code."
+      valid: false,
+      message: "Could not check verification code."
     });
   }
 });
 
+// Start server
 app.listen(PORT, () => {
-  console.log(`Phone validation API listening on port ${PORT}`);
+  console.log(`Phone validation API + Verify listening on port ${PORT}`);
 });
